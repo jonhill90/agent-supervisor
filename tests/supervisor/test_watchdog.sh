@@ -323,7 +323,7 @@ SRC="$A/src"
 git -C "$SRC" config user.email t@e.com; git -C "$SRC" config user.name T
 git -C "$SRC" checkout -q -b main
 mkdir -p "$SRC/scripts/supervisor"
-for f in watchdog.sh advance-live.sh poller-window.sh sleepcheck.py watchdog_notify.py loop-tick.md harness-registry.sh; do
+for f in watchdog.sh advance-live.sh poller-window.sh poller-recover.sh sleepcheck.py watchdog_notify.py loop-tick.md harness-registry.sh; do
   cp "$HERE/../../scripts/supervisor/$f" "$SRC/scripts/supervisor/"
 done
 cp -R "$HERE/../../scripts/supervisor/harness" "$SRC/scripts/supervisor/"
@@ -538,6 +538,133 @@ if grep -q '^advance:' "$D/w/st" 2>/dev/null; then
   say_bad "a watchdog that is not the live copy does not advance anything" "reported $(grep '^advance:' "$D/w/st")"
 else
   say_ok "a watchdog that is not the live copy does not advance anything"
+fi
+
+# --- agent-supervisor#57: the prompt poller relaunch must survive the copy -
+#
+# advance_on_exit runs advance-live.sh from a COPY (mktemp dir), not the real
+# scripts/supervisor -- see the "TWO CALLERS" note atop advance-live.sh. #48's
+# prompt_poller_relaunch() needs poller-recover.sh sitting beside it
+# ($HERE/poller-recover.sh, $HERE resolving to whatever directory the running
+# copy lives in). If the copy step only stages advance-live.sh and
+# poller-window.sh, that check fails on every watchdog-triggered tick --
+# silently, because the flag is still written and POLLER-RESTART-REQUESTED
+# is still logged on the failure branch -- and only the watchdog's own 180s
+# poller-recover.sh backstop ever relaunches it. loop-tick.md's direct call
+# (adv_direct, tested above) never hits this: it runs the real, uncopied
+# scripts/supervisor, where poller-recover.sh has always been beside it.
+#
+# This drives the exact production path -- real tmux (an isolated socket,
+# never the default one; see tmux.md), the real watchdog.sh exit trap, the
+# real copy_dir advance_on_exit builds -- not a stub, because the bug lives
+# in what that copy step stages, not in any single script's own logic.
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "  SKIP no tmux on PATH -- agent-supervisor#57 prompt poller relaunch"
+else
+  # shellcheck source=./tmux-isolation.sh
+  source "$HERE/../../scripts/supervisor/tmux-isolation.sh"
+  RT57="$(mktemp -d "${TMPDIR:-/tmp}/watchdog-57-tmux.XXXXXX")"
+  OLD_TMUX="${TMUX-}"
+  OLD_TMUX_TMPDIR="${TMUX_TMPDIR-}"
+  unset TMUX
+  export TMUX_TMPDIR="$RT57"
+  S57_SESSION="watchdog-57-$$"
+  if ! assert_isolated_tmux; then
+    say_bad "setup: isolated tmux socket for #57 prompt relaunch test" "TMUX_TMPDIR=$TMUX_TMPDIR"
+  else
+    say_ok "setup: isolated tmux socket for #57 prompt relaunch test"
+    S57="$(mktemp -d "${TMPDIR:-/tmp}/watchdog-57-state.XXXXXX")"
+    mkdir -p "$S57/transcripts"
+    STAND_IN_57="$RT57/inbox-poll.sh"
+    cat >"$STAND_IN_57" <<'EOF'
+#!/bin/bash
+set -u
+STATUS="${INBOX_POLL_STATUS:?}"
+FLAG="${INBOX_POLL_RESTART_FLAG:?}"
+PID_FILE="${POLLER_PID_FILE:?}"
+SHA="${POLLER_STATUS_SHA:?}"
+mkdir -p "$(dirname "$STATUS")"
+echo "$$" >"$PID_FILE"
+{
+  printf 'checked: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'sha:     %s\n' "$SHA"
+  printf 'state:   ok\n'
+  printf 'pid:     %s\n' "$$"
+} >"$STATUS"
+while :; do
+  if [ -f "$FLAG" ]; then
+    rm -f "$FLAG"
+    exit 0
+  fi
+  sleep 0.1
+done
+EOF
+    chmod +x "$STAND_IN_57"
+
+    tmux new-session -d -s "$S57_SESSION" -x 200 -y 50
+    STATUS57="$S57/inbox-poll.status"
+    PID57="$S57/pid"
+    LAUNCH57="INBOX_POLL_STATUS='$STATUS57' INBOX_POLL_RESTART_FLAG='$S57/.inbox-poll-restart-requested' POLLER_PID_FILE='$PID57' POLLER_STATUS_SHA='stale-before-57' exec '$STAND_IN_57'"
+    tmux new-window -t "$S57_SESSION" -n inbox-poll -d -- "$LAUNCH57"
+    tmux set-window-option -t "$S57_SESSION:inbox-poll" remain-on-exit on >/dev/null 2>&1
+
+    wait_for_pid_file_57() {
+      local deadline=$((SECONDS + 8))
+      while [ ! -s "$PID57" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.1; done
+      [ -s "$PID57" ]
+    }
+    await_replacement_57() {
+      local old="$1" deadline=$((SECONDS + 8)) new
+      while [ "$SECONDS" -lt "$deadline" ]; do
+        new=$(cat "$PID57" 2>/dev/null)
+        if [ -n "$new" ] && [ "$new" != "$old" ] && kill -0 "$new" 2>/dev/null; then
+          printf '%s\n' "$new"
+          return 0
+        fi
+        sleep 0.1
+      done
+      return 1
+    }
+
+    if wait_for_pid_file_57; then
+      old57=$(cat "$PID57")
+      say_ok "setup: stale poller is running before the flag is written"
+    else
+      old57=""
+      say_bad "setup: stale poller is running before the flag is written" "no pid file"
+    fi
+
+    out57=$(SUPERVISOR_STATE="$S57" SUPERVISOR_STATUS="$S57/st" SUPERVISOR_LOG="$S57/lg" \
+      SUPERVISOR_STAMP="$S57/stamp" SUPERVISOR_HISTORY="$S57/hist" NOTIFY_ENV="$S57/none.env" \
+      SLEEPCHECK_DIR="$S57/transcripts" SUPERVISOR_LIVE="$LIVE" \
+      SUPERVISOR_PANE="watchdog-57-no-such-session:0.0" LANES_SESSION="$S57_SESSION" \
+      POLLER_LAUNCH_CMD="$LAUNCH57" \
+      INBOX_POLL_RELAUNCH_WAIT_SECONDS=6 \
+      bash "$LIVE/scripts/supervisor/watchdog.sh" 2>&1); rc57=$?
+    want_exit "a flag-triggered exit under the real watchdog exit trap still exits 0" "$rc57" 0 "$out57"
+
+    new57=$(await_replacement_57 "$old57" || true)
+    if [ -n "$new57" ]; then
+      say_ok "flag written while the poller runs -> a different live pid within seconds (through watchdog.sh's exit trap)"
+    else
+      say_bad "flag written while the poller runs -> a different live pid within seconds (through watchdog.sh's exit trap)" \
+        "old=$old57 current=$(cat "$PID57" 2>/dev/null) advance-live.log=$(cat "$S57/advance-live.log" 2>/dev/null) watchdog.log=$(cat "$S57/lg" 2>/dev/null)"
+    fi
+    if grep -qi 'POLLER-RESTART-REQUESTED' "$S57/advance-live.log" 2>/dev/null; then
+      say_ok "the restart is logged in advance-live.log (not watchdog.log -- log() never writes there)"
+    else
+      say_bad "the restart is logged in advance-live.log (not watchdog.log -- log() never writes there)" \
+        "$(cat "$S57/advance-live.log" 2>/dev/null)"
+    fi
+
+    tmux kill-session -t "$S57_SESSION" 2>/dev/null
+    pkill -KILL -f "$STAND_IN_57" 2>/dev/null
+    rm -rf "$S57"
+  fi
+  unset TMUX
+  if [ -n "$OLD_TMUX_TMPDIR" ]; then export TMUX_TMPDIR="$OLD_TMUX_TMPDIR"; else unset TMUX_TMPDIR; fi
+  if [ -n "$OLD_TMUX" ]; then export TMUX="$OLD_TMUX"; else unset TMUX; fi
+  rm -rf "$RT57"
 fi
 
 git -C "$SRC" worktree remove --force "$LIVE" >/dev/null 2>&1

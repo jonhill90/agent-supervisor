@@ -620,7 +620,15 @@ advance_on_exit() {
   copy="$copy_dir/advance-live.sh"
   cp "$HERE/advance-live.sh" "$copy" 2>/dev/null || { rm -rf "$copy_dir" 2>/dev/null; return $rc; }
   cp "$HERE/poller-window.sh" "$copy_dir/poller-window.sh" 2>/dev/null || { rm -rf "$copy_dir" 2>/dev/null; return $rc; }
-  out=$(SUPERVISOR_STATE="$STATE" SUPERVISOR_STATUS="$STATUS" bash "$copy" "$root" 2>&1)
+  # agent-supervisor#57: point the copy's prompt poller relaunch at THIS
+  # $HERE (the real, uncopied scripts/supervisor this watchdog itself runs
+  # from), not the copy_dir default. Staging poller-recover.sh into copy_dir
+  # would not fix this -- copy_dir is removed a few lines down, before the
+  # relaunch's background waiter (which can still be sleeping on the old pid)
+  # ever gets to run it. $HERE outlives copy_dir and is exactly the live
+  # worktree's own scripts/supervisor, which is what the relaunch should run.
+  out=$(SUPERVISOR_STATE="$STATE" SUPERVISOR_STATUS="$STATUS" ADVANCE_POLLER_RECOVER="$HERE/poller-recover.sh" \
+        bash "$copy" "$root" 2>&1)
   arc=$?
   rm -rf "$copy_dir" 2>/dev/null
   out=$(printf '%s' "$out" | tr '\n' ' ')

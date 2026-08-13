@@ -128,6 +128,13 @@
 #   LANES_SESSION / LANES_POLLER_WINDOW  same poller-window recognition knobs
 #                                        lanes.sh and poller-recover.sh use;
 #                                        defaults agent-dotfiles / inbox-poll
+#   ADVANCE_POLLER_RECOVER        path to poller-recover.sh for the prompt
+#                                 relaunch (agent-supervisor#57); default
+#                                 $HERE/poller-recover.sh. watchdog.sh sets
+#                                 this to ITS OWN pre-copy $HERE when it runs
+#                                 this script from a throwaway copy, because
+#                                 that copy is deleted before the relaunch's
+#                                 background waiter gets to use it
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -463,13 +470,28 @@ maybe_restart_poller() {
 }
 
 prompt_poller_relaunch() { # prompt_poller_relaunch <pane> <old-sha> <live-sha> <old-pid>
-  local pane="$1" poller_sha="$2" live_sha="$3" poller_pid="$4"
+  local pane="$1" poller_sha="$2" live_sha="$3" poller_pid="$4" recover
   if [ -z "$poller_pid" ]; then
     log "POLLER-PROMPT-RELAUNCH-SKIPPED: $INBOX_POLL_STATUS_PATH has no pid: line, so advance-live.sh cannot tell when the old poller is gone; watchdog poller-recover.sh remains the backstop"
     return 1
   fi
-  if [ ! -x "$HERE/poller-recover.sh" ]; then
-    log "POLLER-PROMPT-RELAUNCH-SKIPPED: no executable poller-recover.sh beside advance-live.sh"
+  # agent-supervisor#57: overridable via ADVANCE_POLLER_RECOVER, defaulting to
+  # $HERE as before. watchdog.sh runs this script from a throwaway copy (see
+  # the "TWO CALLERS" note atop this file) so it can check the candidate out
+  # over itself; $HERE there is the copy directory, which watchdog.sh deletes
+  # the instant this script's synchronous run returns -- before the
+  # background waiter below, which can still be sleeping on the old pid, ever
+  # gets to invoke it. Staging poller-recover.sh into the copy does not fix
+  # that: it would still be deleted out from under the waiter. So the copy's
+  # own advance_on_exit sets this to ITS OWN pre-copy $HERE, which is never
+  # deleted and IS the live worktree's scripts/supervisor -- poller-recover.sh
+  # is not part of what the smoke test is verifying (that IS
+  # $HERE/advance-live.sh, deliberately, up in the run-gate above), so running
+  # a copy of it that outlives copy_dir is both correct and immune to the
+  # copy_dir's lifetime.
+  recover="${ADVANCE_POLLER_RECOVER:-$HERE/poller-recover.sh}"
+  if [ ! -x "$recover" ]; then
+    log "POLLER-PROMPT-RELAUNCH-SKIPPED: no executable poller-recover.sh at $recover"
     return 1
   fi
   (
@@ -484,7 +506,7 @@ prompt_poller_relaunch() { # prompt_poller_relaunch <pane> <old-sha> <live-sha> 
       done
     fi
     out=$(SUPERVISOR_STATE="$STATE" SUPERVISOR_LIVE="$LIVE" LANES_SESSION="$INBOX_POLL_SESSION" \
-          "$HERE/poller-recover.sh" 2>&1)
+          "$recover" 2>&1)
     rc=$?
     if [ "$rc" -ne 0 ]; then
       log "POLLER-PROMPT-RELAUNCH-FAILED rc=$rc: pane $pane, poller was $poller_sha, live now $live_sha: $out"
