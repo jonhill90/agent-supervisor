@@ -1,0 +1,8 @@
+#!/bin/bash
+# Stub `gh` for test_verify_and_close.sh. Records every invocation (so a
+# test can assert `gh issue close` was, or crucially was NOT, called) and
+# exits $STUB_GH_EXIT (default 0), so a test can force the "check passed but
+# gh itself failed" path without a real GitHub call.
+: >>"${STUB_GH_LOG:?STUB_GH_LOG must be set}"
+printf '%s\n' "$*" >>"$STUB_GH_LOG"
+exit "${STUB_GH_EXIT:-0}"

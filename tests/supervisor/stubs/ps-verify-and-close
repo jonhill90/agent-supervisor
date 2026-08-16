@@ -1,0 +1,32 @@
+#!/bin/bash
+# Stub `ps` for test_verify_and_close.sh. verify_and_close.sh's ancestry
+# walk asks two questions, the same pair watchdog.sh's duplicate-poller
+# detector already asks (tests/supervisor/stubs/ps covers that one) --
+# `ps -o ppid= -p PID` and `ps -o lstart= -p PID`. This stub is deliberately
+# simpler than that one: every pid's ppid resolves to the SAME configurable
+# value, $STUB_PS_FIXED_PPID, standing in for "one process tree" -- a test
+# sets it to the registered anchor pid to simulate the supervisor's own
+# ancestry, or to an unrelated pid to simulate a lane's (a different pane's
+# process tree, which never has the anchor as an ancestor no matter how many
+# hops are walked). Unset entirely, it simulates `ps` itself failing to
+# report ancestry -- identity_check must refuse, not guess.
+field=""; pid=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) field="${2:-}"; shift 2 ;;
+    -p) pid="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$pid" ] || exit 1
+case "$field" in
+  ppid=)
+    [ -n "${STUB_PS_FIXED_PPID:-}" ] || exit 1
+    printf '%s\n' "$STUB_PS_FIXED_PPID"
+    ;;
+  lstart=)
+    name="STUB_PS_LSTART_${pid}"
+    printf '%s\n' "${!name:-Thu Aug 13 04:05:56 2026}"
+    ;;
+  *) exit 1 ;;
+esac

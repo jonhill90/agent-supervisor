@@ -29,7 +29,9 @@ scripts/supervisor/          the system
   session_guard.py           the one place session removal is judged safe
   watchdog.sh                liveness, from OUTSIDE the loop
   inbox-poll.sh              Telegram poller (a service, never a lane)
-tests/supervisor/            44 files; the suite is the contract
+  verify_and_close.sh        the ONLY path that closes an issue (#247); a
+                             lane reports, never certifies -- see its header
+tests/supervisor/            45 files; the suite is the contract
 ```
 
 ## Invariants — do not break these without an explicit decision
