@@ -330,22 +330,60 @@ entire plan.** Every downstream count would be second-hand — the PRP's own ded
 
 ---
 
-### 🟢 Group 2 — Chain Heads (PARALLEL, 5 agents)
+### 🟢 Group 2 — Chain Heads (PARALLEL, 3 agents)
 
-**Tasks**: 5 · **Mode**: PARALLEL · **Duration**: ~90 min (T25) · **Depends on**: G1
+**Tasks**: 3 · **Mode**: PARALLEL · **Duration**: ~60 min (T8) · **Depends on**: G1
 
 | # | Task | Files (exclusive) | Depends on | Est |
 |---|---|---|---|---|
-| T2 | Register the owned sessions (A2) | `register-owned-sessions.sh`, `test_register_owned_sessions.sh` | T1 | 30 |
 | T3 | Make `bootstrap-session.sh` repairable | `bootstrap-session.sh`, `test_bootstrap_session.sh` | — | 40 |
 | T8 | Advance `live/` + repoint every plist (A8) | 6 plists, `check-plists-live.py`, `test_check_plists_live.py` | — | 60 |
-| T22 | **THE HOOK SPIKE** | `hook-spike.sh`, `hook-spike-results.md` | — | 40 |
 | T25 | Ledger schema — trigger, provenance, dead writers | `core.py`, `test_core.py`, `test_core_interrogative_trigger.py` | T1 | 90 |
 
-**Why these can run in parallel**: all five file sets are pairwise disjoint. They are the heads of the
-four independent chains plus T2, which feeds the reaper's trigger.
+> **T2 and T22 were moved out of this group. Both were real hazards, and the file-disjointness rule
+> could not see either of them** — which is the finding, not a footnote. Exclusive file ownership is
+> necessary and not sufficient: it protects files, and both of these collide on something that is not
+> a file.
+>
+> **T2 → Group 3.** Clause 5 of the safety contract states ledger writes are *"never concurrent."*
+> T2 does `adopt-session` INSERTs plus a guarded `DELETE` on the live DB; T25 runs
+> `ALTER TABLE prompts ADD COLUMN provenance` and `CREATE TRIGGER`. Their FILES sets are disjoint and
+> they were scheduled together — the plan's **own** finding F-12 identified this pair and then placed
+> them in the same group. Same SQLite file, WAL mode, concurrent writers.
+>
+> **T22 → its own solo group, G2a.** See below. It mutates a resource shared by every concurrent agent
+> on the machine.
 
-**Hard constraints binding this group**:
+**Why these three can run in parallel**: file sets are pairwise disjoint **and** none writes a shared
+non-file resource concurrently with another. T25 is now the sole ledger writer in this group.
+
+### 🟢 Group 2a — The Hook Spike (SOLO, 1 agent)
+
+**Tasks**: 1 · **Mode**: SOLO — no sibling agents may be running · **Duration**: ~40 min
+
+| # | Task | Files (exclusive) | Depends on | Est |
+|---|---|---|---|---|
+| T22 | **THE HOOK SPIKE** | `hook-spike.sh`, `hook-spike-results.md`, *(temporarily)* `~/.claude/settings.json` | — | 40 |
+
+**Why solo, measured rather than assumed.** T22 step 1 installs a marker hook into
+`~/.claude/settings.json`; step 3 deliberately installs a **missing hook path** to determine whether
+Claude Code fails open or closed. That file is **user-global**: every concurrent `claude` process on
+the machine reads it. If the answer to (b) is "fails closed", T22 blocks its own siblings mid-task —
+and this estate runs up to 162 `claude -p` lanes.
+
+Two further defects this move repairs, both found by adversarial review:
+
+1. **`~/.claude/settings.json` is not in T22's declared FILES** (`estate_remediation.md:1250-1252`
+   lists only `hook-spike.sh` and `hook-spike-results.md`), while clause 5 names **T23** its sole
+   owner. Clause 6 says an agent finding a file it does not own *"stops and reports"* — so a
+   **compliant** T22 agent halts, which hard-blocks T23, which blocks the whole hooks chain. The
+   contract defeated the task it was protecting.
+2. `gotchas.md:443/458/584` names the *file* risk and never the *concurrency* composition.
+
+T22's FILES list is amended above to declare the temporary mutation explicitly, and the task must
+restore the backup before releasing its lane. **T22 → T23 remains an absolute barrier.**
+
+**Hard constraints binding G2/G2a**:
 - **T8 must complete before T10 (G3).** Non-negotiable order: advance `live/` → repoint → verify with
   `launchctl print` → *only then* wrap. T8 owns steps 1–3; T10 owns step 4.
 - **T22 must complete before T23 (G3).** Two hook behaviours are undocumented — whether
@@ -356,25 +394,45 @@ four independent chains plus T2, which feeds the reaper's trigger.
 - **T25 must not use `REGEXP`.** Python's `sqlite3` defines none; the trigger would brick every INSERT
   into `items`, honest ones included, and `core.py` is the writer. `GLOB '*[?]'`, never `'*?'`.
 
-**Validation gate — ALL must pass before G3 starts**:
+**Validation gate — ALL must pass before G3 starts.**
+
+> **EVERY GATE IN THIS PLAN WAS A PRINT, NOT AN ASSERTION — all eight of them.** The plan mandates
+> *"Every gate: an `if …; then echo '::error::…'; exit 1; fi`"* for the code it ships, then violated
+> that rule in its own gates. `grep -c` prints `0` and exits 1; under a non-`set -e` block that is
+> indistinguishable from success, and a human skimming output sees a number rather than a verdict.
+> Rewritten below as assertions. The same rewrite applies to every group gate in this document.
+
 ```bash
-# T2
-bash tests/supervisor/test_register_owned_sessions.sh
+set -o pipefail
+fail() { echo "::error::$*" >&2; exit 1; }
+
 # T3
-bash tests/supervisor/test_bootstrap_session.sh
-grep -n 'set -euo pipefail' scripts/supervisor/bootstrap-session.sh   # :63 must still be there
-# T8 — the acceptance reads the RUNNING arguments, never the file on disk
-python3 scripts/supervisor/check-plists-live.py; echo "want 0 now; the committed BEFORE run wanted 1"
-launchctl print gui/$UID/com.jonhill.director-loop | grep -E 'state|last exit|path'
-for p in launchd/*.plist; do plutil -lint "$p" || echo "LINT FAIL $p"; done
-python3 -m unittest tests.supervisor.test_check_plists_live -v
-# T22 — a conclusion without output does not count
-test -s docs/audit/2026-08-19-council/hook-spike-results.md
-grep -c '^\$ ' docs/audit/2026-08-19-council/hook-spike-results.md    # commands present
-diff ~/.claude/settings.json ~/.claude/settings.json.pre-spike-backup  # byte-identical
+bash tests/supervisor/test_bootstrap_session.sh || fail "T3 suite red"
+grep -q 'set -euo pipefail' scripts/supervisor/bootstrap-session.sh \
+  || fail "T3: bootstrap-session.sh lost its set -euo (the one file in the repo that has it)"
+
+# T8 — the acceptance reads the RUNNING arguments, never the file on disk.
+# A plist on disk records intent; launchctl records what is actually loaded.
+python3 scripts/supervisor/check-plists-live.py || fail "T8: a live job still runs off-main"
+launchctl print "gui/$UID/com.jonhill.director-loop" >/dev/null 2>&1 \
+  || fail "T8: director-loop is not loaded in the user domain"
+for p in launchd/*.plist; do
+  plutil -lint "$p" >/dev/null || fail "T8: $p failed plutil lint"
+done
+# plutil is used deliberately: plistlib.load() raises on 5 of 6 of these files because XML
+# forbids '--' inside comments and the house comment style uses it. A Python sweep that
+# skips parse errors reports ONE compliant plist and ZERO violations — a false clean.
+n_plists=$(ls -1 launchd/com.jonhill.*.plist 2>/dev/null | wc -l | tr -d ' ')
+[ "$n_plists" -eq 6 ] || fail "T8: expected 6 plists, linted $n_plists — the loop saw the wrong set"
+python3 -m unittest tests.supervisor.test_check_plists_live -v || fail "T8 unit tests red"
+
 # T25
-python3 -m unittest tests.supervisor.test_core_interrogative_trigger -v
-grep -rn 'REGEXP' scripts/supervisor/core.py                          # expect ZERO
+python3 -m unittest tests.supervisor.test_core_interrogative_trigger -v || fail "T25 trigger tests red"
+if grep -rn 'REGEXP' scripts/supervisor/core.py; then
+  fail "T25: REGEXP in core.py — Python's sqlite3 has no regexp(); this bricks EVERY insert into items"
+fi
+# positive control: the grep must be able to see the file at all
+grep -q 'def ' scripts/supervisor/core.py || fail "T25: grep cannot read core.py — blind, not clean"
 grep -rn "GLOB '\*?'" scripts/supervisor/                             # expect ZERO
 ```
 **Barrier is hard.** T10 and T23 in G3 are each gated on a *specific* G2 task's output, not merely on
@@ -407,18 +465,79 @@ T4 creates a new plist under a new name — no intersection with T10's six.
 **T28 before T27 — see finding F-2.** T28's committed red run is T27's before-picture. It is destroyed
 if the repair lands first.
 
-**Validation gate — ALL must pass before G4 starts**:
+**T2 joins this group** (moved out of G2): it is the plan's only other live-ledger writer, and clause 5
+forbids it running concurrently with T25. T25 completes in G2; T2 writes here.
+
+| T2 | Register the owned sessions (A2) | `register-owned-sessions.sh`, `test_register_owned_sessions.sh` | T1, **T25** | 30 |
+
+**Validation gate — ALL must pass before G4 starts.**
+
+> **The T4 gate below was the worst defect in this plan, and it guards the one claim the whole audit
+> turns on.** An adversarial reviewer executed the previous version against a reaper that was
+> `exit 0` and nothing else:
+>
+> ```
+> healthy tick rc=0 (want 0)
+> still exactly one session
+> absent tick  rc=0 (want 0)
+> no server running on /private/tmp/reaper-int.uBNZ18/tmux-501/int
+> ```
+>
+> **A do-nothing reaper passed.** `RECREATED` never printed — `has-session` returned 1 and the `&&`
+> short-circuited — so there was no failure token, no non-zero exit, and no error text an orchestrator
+> could match. The plan's own idiom is *"silence = clean"*; here silence is the catastrophe. Rewritten
+> as assertions, with a mutation check that proves the gate can go red.
+
 ```bash
-# T4 — the claim the whole audit turns on, in an isolated tmux
+set -o pipefail
+fail() { echo "::error::$*" >&2; exit 1; }
+
+# T4 — the claim the whole audit turns on, in an isolated tmux server.
+# TMUX_TMPDIR + -L int: a test fixture once claimed a PRODUCTION session name on the
+# default socket and the live loop ticked it. Isolation is not optional here.
 export TMUX_TMPDIR=$(mktemp -d /tmp/reaper-int.XXXXXX)
-tmux -L int new-session -d -s prodlike
-bash scripts/supervisor/session-reaper.sh --session prodlike; echo "healthy tick rc=$? (want 0)"
-tmux -L int has-session -t '=prodlike'   && echo "still exactly one session"
-tmux -L int kill-session -t '=prodlike'                 # EXACT match; NEVER kill-server
-bash scripts/supervisor/session-reaper.sh --session prodlike; echo "absent tick rc=$? (want 0)"
-tmux -L int has-session -t '=prodlike'   && echo "RECREATED"
-rm -rf "$TMUX_TMPDIR"
-grep -rn 'new-session -A' scripts/supervisor/           # expect ZERO — gotchas Critical 3
+trap 'tmux -L int kill-server 2>/dev/null; rm -rf "$TMUX_TMPDIR"' EXIT
+# ^ kill-server is safe ONLY because -L int + TMUX_TMPDIR guarantee a private server.
+#   Never on the default socket: a bare kill-server destroyed this estate three times.
+
+tmux -L int new-session -d -s prodlike || fail "T4 harness: could not create the fixture session"
+tmux -L int has-session -t '=prodlike' || fail "T4 harness blind: fixture absent before we began"
+
+bash scripts/supervisor/session-reaper.sh --session prodlike \
+  || fail "T4: reaper returned non-zero on a HEALTHY tick — it would fail every 300s forever"
+tmux -L int has-session -t '=prodlike' \
+  || fail "T4: the reaper DESTROYED a healthy session"
+[ "$(tmux -L int list-sessions -F '#S' | grep -c '^prodlike$')" -eq 1 ] \
+  || fail "T4: duplicate session — 'new-session -A' prefix-matching creates decoys"
+
+tmux -L int kill-session -t '=prodlike' || fail "T4 harness: could not remove the fixture"
+if tmux -L int has-session -t '=prodlike' 2>/dev/null; then
+  fail "T4 harness blind: session still present after kill — the rest of this gate is meaningless"
+fi
+
+bash scripts/supervisor/session-reaper.sh --session prodlike \
+  || fail "T4: reaper returned non-zero on the ABSENT tick — the case it exists for"
+# THE ASSERTION. Previously an && that short-circuited into silence.
+tmux -L int has-session -t '=prodlike' \
+  || fail "T4: SESSION NOT RECREATED — a do-nothing reaper reaches this line. THE PLAN STOPS HERE."
+echo "T4 RECREATED — unattended recovery proven"
+
+# MUTATION CHECK: the gate must be able to go red. Re-run the absent-tick assertion
+# against a stub that does nothing; if this does NOT fail, the gate is decoration.
+stub=$(mktemp); printf '#!/usr/bin/env bash\nexit 0\n' > "$stub"; chmod +x "$stub"
+tmux -L int kill-session -t '=prodlike' 2>/dev/null
+"$stub" --session prodlike
+if tmux -L int has-session -t '=prodlike' 2>/dev/null; then
+  fail "T4 mutation check is broken — a do-nothing stub 'recreated' the session"
+fi
+echo "T4 mutation check OK — a do-nothing reaper is detected"
+rm -f "$stub"
+
+if grep -rn 'new-session -A' scripts/supervisor/; then
+  fail "T4: 'new-session -A' present — fails rc=1 headless from launchd (open terminal failed: not a terminal) AND prefix-creates decoy sessions. Use: has-session -t '=n' || new-session -d -s n"
+fi
+# positive control: the grep must be able to see this directory at all
+grep -rq 'new-session' scripts/supervisor/ || fail "T4: grep found no new-session anywhere — blind, not clean"
 # T10 — the wrapper is live on five jobs and NOT on the reaper
 launchctl print gui/$UID/com.jonhill.director-loop | grep run-from-main
 launchctl print gui/$UID/com.jonhill.session-reaper | grep -c run-from-main   # want 0 (exempt)
@@ -755,48 +874,116 @@ worktree. They are host state. See clause 5.
 
 ### 2. Exclusive file ownership, declared up front
 
-Every task's FILES set is written to a machine-readable manifest **before G1 starts**:
+Every task's FILES set is **derived** into a machine-readable manifest **before G1 starts**:
 
-`prps/estate_remediation/execution/ownership.tsv` — two tab-separated columns, `task<TAB>path`, one
-row per file, 35 tasks, ~140 rows.
+```bash
+bash prps/estate_remediation/execution/build-ownership-manifest.sh
+```
 
-**The duplicate-claim detector** — run before every group, and by each agent before its first write:
+`ownership.tsv` — `task<TAB>path<TAB>verb`, **142 rows across 35 tasks**, generated from the PRP's own
+task blocks. It is derived, never hand-maintained: a hand-kept manifest drifts from the tasks it claims
+to describe, and a manifest that disagrees with the plan is worse than none.
+
+**This section previously specified a detector that could not fail, and a manifest that did not exist.**
+Both are corrected here rather than quietly replaced, because the defect is instructive. The old text was:
 
 ```bash
 # Any output at all = a duplicate claim = STOP. Silence = clean.
-cut -f2 prps/estate_remediation/execution/ownership.tsv | sort | uniq -d
+cut -f2 .../ownership.tsv | sort | uniq -d
 ```
 
-Expected output today: **the six `launchd/com.jonhill.*.plist` paths, and nothing else** — the T8/T10
-serialization. Anything beyond those six is an unplanned collision and the group must not start.
+Measured against a **missing** manifest:
 
-The positive control on the detector itself, because a check that has never been observed firing has
-not been observed to be a check:
+```
+OLD  (cut|sort|uniq -d): output='' rc=0   -> reads as CLEAN
+NEW  build-ownership-manifest.sh rc=3     -> HALTS
+```
+
+`cut` writes its error to stderr, `sort` and `uniq` emit nothing, the pipeline exits 0 — so an absent
+manifest was indistinguishable from a clean one. That is `[ "$n" -gt 0 ]` with a different verb, and it
+is the exact defect class this whole plan exists to remove, reproduced inside the plan's own headline
+safety check. It was found by an adversarial reviewer **running** the detector, not reading it.
+
+**The detector now exits explicitly, and every failure path is mutation-verified:**
+
+| Mutation | Expected | Measured |
+|---|---|---|
+| M1 manifest/PRP unreadable | 3 — could-not-measure | **rc=3** |
+| M2 planted duplicate (`T99 watchdog.sh`) | 1 — violation, names both owners | **detected** |
+| M3 truncated to 19 rows | 3 — parser stopped early, blind not clean | **detected** |
+| M4 zero duplicates (T8/T10 blocks unseen) | 3 — positive control fires | **detected** |
+| M5 unmodified manifest | 0 — clean | **rc=0** |
+
+M4 is the load-bearing one. Exactly **six** duplicates are expected — the `launchd/com.jonhill.*.plist`
+paths of the T8/T10 serialization. **Zero duplicates is a failure, not a pass**, because it means the
+parser never saw those blocks. A blind detector and a clean estate look identical; only a check with a
+known-present signal can tell them apart.
+
+Three exit codes, never two: **0** clean · **1** violation, group must not start · **3** could-not-measure.
+
+### 2b. The write no task owns — cron applies T25's migration, not an agent
+
+**`core.py:270-274` runs the `_migrate_*` methods inside `Store.__init__`** — on *every* construction,
+by every process that opens the ledger. There is no migrations directory and no `PRAGMA user_version`;
+migration IS object construction.
+
+The consequence the FILES rule cannot express: **the moment T25 merges, the next tick of
+`director-loop`, `supervisor-watchdog`, `quota-watch` or `heartbeat` applies the schema change** — an
+`ALTER TABLE` and a `CREATE TRIGGER` — at an unpredictable instant, possibly mid-G3 while T8/T10 are
+booting those very jobs out and back in. **No task owns that write and no gate observes it.** A
+crash-safety defect would land in production without any agent having run it.
+
+Exclusive file ownership does not help: `core.py` has exactly one owner (T25), and the *writer* is
+five scheduled jobs that own nothing.
+
+**Required, and T25 does not currently carry these:**
 
 ```bash
-# positive-control: plant a duplicate and assert the detector reports it
-{ cat prps/estate_remediation/execution/ownership.tsv; printf 'T99\tscripts/supervisor/core.py\n'; } \
-  | cut -f2 | sort | uniq -d | grep -q 'core.py' \
-  && echo "detector works" || echo "DETECTOR BLIND — do not trust a clean run"
+# BEFORE merging T25 — quiesce the writers, then apply deliberately.
+for j in director-loop supervisor-watchdog quota-watch supervisor-heartbeat; do
+  launchctl bootout "gui/$UID/com.jonhill.$j" 2>/dev/null
+done
+bash scripts/supervisor/ledger-snapshot.sh --out "$STATE/pre-T25.sqlite3" || exit 3
+python3 -c 'from scripts.supervisor.core import Store; Store()'   # apply, once, observed
+# verify the schema landed before anything is restarted
+python3 - <<'PY' || exit 1
+import sqlite3, sys
+c = sqlite3.connect("file:LEDGER?mode=rw", uri=True)
+cols = [r[1] for r in c.execute("PRAGMA table_info(prompts)")]
+sys.exit(0 if "provenance" in cols else 1)
+PY
+for j in director-loop supervisor-watchdog quota-watch supervisor-heartbeat; do
+  launchctl bootstrap "gui/$UID" "launchd/com.jonhill.$j.plist" || exit 1
+done
 ```
 
-And the manifest must be proven non-empty before any "no duplicates" claim — the estate's own idiom
-from `test_shell_suites.py:65-68`:
-
-```bash
-[ "$(wc -l < prps/estate_remediation/execution/ownership.tsv)" -gt 100 ] \
-  || { echo "REFUSED: manifest too small to be complete — not reporting zero collisions"; exit 3; }
-```
+Cheaper alternative if quiescing is judged too invasive: make the migration **refuse** rather than
+apply when it detects it is not running under the migration task — an env gate
+(`SUPERVISOR_ALLOW_MIGRATE=1`) checked in `_migrate_*`, so a cron tick that would silently migrate
+instead logs and exits. **That is a T25 scope change and Jon should choose between them.**
 
 ### 3. Ledger claim before touching files
 
-The claim mechanism is the estate's own, and it is claimed **before** the first write, not after:
+The claim mechanism is the estate's own, claimed **before** the first write:
 
 ```bash
-python3 scripts/supervisor/cli.py lane-claim --lane "prp-T${N}" --task "estate-remediation/T${N}"
+TOKEN="prp-T${N}-$(date -u +%s)"
+python3 scripts/supervisor/cli.py claim-lane --lane "prp-T${N}" --token "$TOKEN" || exit 3
 # ... work ...
-python3 scripts/supervisor/cli.py lane-free  --lane "prp-T${N}" --reason "T${N} complete, gate green"
+python3 scripts/supervisor/cli.py release-lane-claim --lane "prp-T${N}" --token "$TOKEN"
 ```
+
+**This too was a mechanism-free claim.** The previous text specified
+`cli.py lane-claim --lane … --task …`. Measured:
+
+```
+cli.py: error: argument command: invalid choice: 'lane-claim'
+```
+
+There is no `lane-claim` subcommand — it is `claim-lane`, and its signature is `--lane --token
+[--owner-pid]`, with no `--task`. All 35 agents would have run this once each; every one would have
+failed, and argparse exits **2**, not the exit 3 this contract mandates. Corrected above against
+`cli.py --help`, not against memory.
 
 A claim that cannot be written is a **stop**, not a warning: exit 3, never proceed. Two agents holding
 the same lane is the same defect class as two workflows declaring `gate:` (T15/E1) — and that one
