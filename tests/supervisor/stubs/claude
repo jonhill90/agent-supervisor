@@ -16,10 +16,19 @@ CLAUDE_PRINT_LOG=<path> -- the prompt text of every `--resume` call is
                           appended here, one per line, so a test can assert
                           the real brief pointer crossed argv, never
                           send-keys.
+CLAUDE_PRINT_RESUME_DELAY=<seconds> -- sleep this long before answering a
+                          `--resume` call only (never the `--session-id`
+                          handshake, which stays instant so `register` is
+                          never what a slow-dispatch test is measuring).
+                          agent-supervisor#278: stands in for a real `claude
+                          -p` turn that takes a while, so a test can prove
+                          `dispatch.sh`/`dispatch-claude-print.sh` return
+                          long before this exits instead of blocking on it.
 """
 import json
 import os
 import sys
+import time
 import uuid
 
 if os.environ.get("CLAUDE_PRINT_BROKEN"):
@@ -46,6 +55,9 @@ if session_id:
         "subtype": "success",
     }
 elif resume_id:
+    delay = os.environ.get("CLAUDE_PRINT_RESUME_DELAY")
+    if delay:
+        time.sleep(float(delay))
     log_path = os.environ.get("CLAUDE_PRINT_LOG")
     if log_path:
         with open(log_path, "a") as fh:

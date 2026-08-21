@@ -599,26 +599,69 @@ class ClaudePrintAdapterTest(unittest.TestCase):
                 lane="claude-print-worker", target=None, harness="claude", repo="/repo/hill90", nonce="nonce-cp"
             )
 
-    def test_assign_task_resumes_the_session_and_completes_synchronously_from_the_result(self):
+    def test_assign_task_writes_delivery_pending_without_touching_the_transport(self):
+        """agent-supervisor#278: `assign_task` is the fast half now -- it
+        writes the ledger row and returns, and never spawns a `claude -p`
+        subprocess at all. `deliver_task` (below) does the real turn."""
         self.adapter.register_lane(
             lane="claude-print-worker", target=None, harness="claude", repo="/repo/hill90", nonce="nonce-cp"
         )
         self.seed_source("cp-task", "Review one artifact")
+        instances_before = len(FakeClaudePrintTransport.instances)
         task = self.adapter.assign_task(lane="claude-print-worker", task_id="cp-task", summary="Review one artifact")
-        self.assertEqual("complete", task["status"])
-
-        # A fresh transport was spawned for this call and terminated
-        # afterward -- no subprocess lingers between CLI invocations.
-        assign_transport = FakeClaudePrintTransport.instances[-1]
-        self.assertTrue(assign_transport.terminated)
-        self.assertIsNotNone(assign_transport.session_id)
-        self.assertIn("cp-task", assign_transport.prompts[0][1])
+        self.assertEqual("delivery_pending", task["status"])
+        # Only `register_lane`'s own handshake transport exists -- assign_task
+        # spawned nothing.
+        self.assertEqual(instances_before, len(FakeClaudePrintTransport.instances))
 
     def test_assign_task_to_unregistered_lane_raises(self):
         with self.assertRaisesRegex(RuntimeError, "unknown lane"):
             self.adapter.assign_task(lane="missing", task_id="t1", summary="x")
 
-    def test_assign_task_does_not_mark_delivered_when_the_transport_raises(self):
+    def test_assign_task_refuses_a_lane_registered_as_send_keys(self):
+        """agent-supervisor#171: `claude` is the one harness allowed either
+        transport -- this adapter must refuse a lane recorded `send-keys`
+        rather than silently drive it over `claude -p` anyway."""
+        self.ledger.register_lane(
+            lane="claude-print-worker",
+            pane_id="%1",
+            nonce="nonce-cp",
+            harness="claude",
+            repo="/repo/hill90",
+            server_id="server-a",
+            session_id="$1",
+            command="claude",
+            transport="send-keys",
+        )
+        with self.assertRaisesRegex(RuntimeError, "not a claude-print lane"):
+            self.adapter.assign_task(lane="claude-print-worker", task_id="t1", summary="x")
+
+    def test_deliver_task_resumes_the_session_and_completes_from_the_result(self):
+        """agent-supervisor#278: the blocking half, split out of
+        `assign_task` so a caller (`dispatch-claude-print.sh`) can return
+        once `assign_task` lands and run this separately, usually
+        backgrounded."""
+        self.adapter.register_lane(
+            lane="claude-print-worker", target=None, harness="claude", repo="/repo/hill90", nonce="nonce-cp"
+        )
+        self.seed_source("cp-task", "Review one artifact")
+        self.adapter.assign_task(lane="claude-print-worker", task_id="cp-task", summary="Review one artifact")
+
+        task = self.adapter.deliver_task(lane="claude-print-worker", task_id="cp-task")
+        self.assertEqual("complete", task["status"])
+
+        # A fresh transport was spawned for this call and terminated
+        # afterward -- no subprocess lingers between CLI invocations.
+        deliver_transport = FakeClaudePrintTransport.instances[-1]
+        self.assertTrue(deliver_transport.terminated)
+        self.assertIsNotNone(deliver_transport.session_id)
+        self.assertIn("cp-task", deliver_transport.prompts[0][1])
+
+    def test_deliver_task_to_unregistered_lane_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "unknown lane"):
+            self.adapter.deliver_task(lane="missing", task_id="t1")
+
+    def test_deliver_task_does_not_mark_delivered_when_the_transport_raises(self):
         """A `claude -p` call that times out or exits without a well-formed
         result (`ClaudePrintTimeoutError`/`ClaudePrintProtocolError` in
         production) must leave the task `delivery_pending`, not `complete`,
@@ -639,19 +682,17 @@ class ClaudePrintAdapterTest(unittest.TestCase):
             lane="claude-print-worker", target=None, harness="claude", repo="/repo/hill90", nonce="nonce-cp"
         )
         self.seed_source("cp-task", "Review one artifact")
+        self.adapter.assign_task(lane="claude-print-worker", task_id="cp-task", summary="Review one artifact")
 
         with self.assertRaisesRegex(RuntimeError, "well-formed result"):
-            self.adapter.assign_task(lane="claude-print-worker", task_id="cp-task", summary="Review one artifact")
+            self.adapter.deliver_task(lane="claude-print-worker", task_id="cp-task")
 
         task = self.ledger.get_task("cp-task")
         self.assertEqual("delivery_pending", task["status"])
-        assign_transport = FakeClaudePrintTransport.instances[-1]
-        self.assertTrue(assign_transport.terminated)
+        deliver_transport = FakeClaudePrintTransport.instances[-1]
+        self.assertTrue(deliver_transport.terminated)
 
-    def test_assign_task_refuses_a_lane_registered_as_send_keys(self):
-        """agent-supervisor#171: `claude` is the one harness allowed either
-        transport -- this adapter must refuse a lane recorded `send-keys`
-        rather than silently drive it over `claude -p` anyway."""
+    def test_deliver_task_refuses_a_lane_registered_as_send_keys(self):
         self.ledger.register_lane(
             lane="claude-print-worker",
             pane_id="%1",
@@ -664,7 +705,7 @@ class ClaudePrintAdapterTest(unittest.TestCase):
             transport="send-keys",
         )
         with self.assertRaisesRegex(RuntimeError, "not a claude-print lane"):
-            self.adapter.assign_task(lane="claude-print-worker", task_id="t1", summary="x")
+            self.adapter.deliver_task(lane="claude-print-worker", task_id="t1")
 
     def test_observe_lane_is_a_no_op_because_prompts_are_synchronous(self):
         self.adapter.register_lane(

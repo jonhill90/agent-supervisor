@@ -462,12 +462,24 @@ class ClaudePrintAdapter:
     Unlike `ACPAdapter`/`PiRPCAdapter`, there is no long-lived protocol
     session to resume mid-call: `claude -p` is a single process that runs a
     turn to completion and exits (see `claude_print_transport.py`'s module
-    docstring). So `assign_task` does not "load" a session before sending --
+    docstring). So `deliver_task` does not "load" a session before sending --
     it hands the recorded `session_id` to a fresh transport as the `--resume`
     target and lets `ClaudePrintTransport.run` do the one subprocess call.
-    Assignment and completion still happen in one round trip, for the same
-    reason as its siblings: `claude -p` already blocks until the turn is
-    genuinely done, so there is no pane to poll in between.
+
+    agent-supervisor#278: `assign_task` and delivery used to be one method,
+    one round trip -- `claude -p` already blocks until the turn is genuinely
+    done, so there was "no pane to poll in between" and the whole thing ran
+    inside a single `operation_lock()`. Measured live: that made a real
+    dispatch indistinguishable from a hang from OUTSIDE this process too --
+    `dispatch.sh`/`dispatch-claude-print.sh` called `assign_task` and got
+    nothing back until the entire task finished, sometimes many minutes
+    later, and it held the ledger's one process-wide flock for that whole
+    span. Split in two: `assign_task` writes `assigned` -> `delivery_pending`
+    and returns (fast, the ledger row a caller can already observe);
+    `deliver_task` does the actual blocking `claude -p` turn and the
+    `delivered` -> `complete` transition, called separately -- by
+    `dispatch-claude-print.sh` backgrounded, or inline when `--wait` asks for
+    the old synchronous behaviour.
     """
 
     def __init__(self, ledger, transport_factory, *, clock=None):
@@ -517,6 +529,15 @@ class ClaudePrintAdapter:
         return record
 
     def assign_task(self, *, lane, task_id, summary):
+        """Fast path only: writes `assigned` then `delivery_pending` and
+        returns -- never touches the transport, never blocks on `claude -p`.
+
+        agent-supervisor#278: this is the ledger row a caller waits for --
+        once this returns, the brief IS on record as delivered-to, whether or
+        not `claude -p` has even started its turn yet. Call `deliver_task`
+        (usually backgrounded by `dispatch-claude-print.sh`, or run inline
+        under `--wait`) to actually run the turn and complete the task.
+        """
         with self.ledger.operation_lock():
             record = self._verified_lane(lane)
             existing = self.ledger.get_task(task_id)
@@ -526,20 +547,45 @@ class ClaudePrintAdapter:
                     "reconcile the task before it can be assigned again"
                 )
             self.ledger.assign(task_id=task_id, lane=lane, pane_nonce=record["nonce"], summary=summary)
-            prompt = (
-                f"[Hill90 task {task_id}] {summary}\n\n"
-                "Do not begin unrelated work. Record commands and actual outputs in a compact result."
-            )
             # Same ambiguous-state-before-physical-send ordering as
-            # ACPAdapter/PiRPCAdapter.assign_task: if the resumed call
-            # raises, the task is left `delivery_pending` rather than
-            # silently eligible for an automatic resend.
-            self.ledger.mark_delivery_pending(task_id, pane_nonce=record["nonce"])
-            transport = self.transport_factory(cwd=record["repo"], session_id=record["session_id"])
-            try:
-                result = transport.run(prompt)
-            finally:
-                transport.terminate()
+            # ACPAdapter/PiRPCAdapter.assign_task: if the delivery that
+            # follows (in `deliver_task`, possibly a different process
+            # entirely) raises or never runs, the task is left
+            # `delivery_pending` rather than silently eligible for an
+            # automatic resend.
+            return self.ledger.mark_delivery_pending(task_id, pane_nonce=record["nonce"])
+
+    def deliver_task(self, *, lane, task_id):
+        """The blocking half `assign_task` used to include inline
+        (agent-supervisor#278). Runs the real `claude -p --resume` turn
+        against the task `assign_task` already wrote as `delivery_pending`,
+        and marks it `delivered` then `complete` from the result.
+
+        Deliberately does NOT hold `operation_lock()` across the `claude -p`
+        call itself -- only around the read of the lane/task beforehand and
+        the two writes after. The one-method version held the ledger's
+        single process-wide flock for the entire turn, which meant every
+        OTHER ledger operation in the estate queued behind however long this
+        one task's `claude -p` call took. Reading the lane/task fresh here
+        (rather than trusting values `assign_task` saw, possibly seconds or
+        minutes earlier in a different process) is what makes the two
+        separate lock scopes safe to split this way.
+        """
+        with self.ledger.operation_lock():
+            record = self._verified_lane(lane)
+            task = self.ledger.get_task(task_id)
+        if task is None:
+            raise RuntimeError(f"unknown task: {task_id}")
+        prompt = (
+            f"[Hill90 task {task_id}] {task['summary']}\n\n"
+            "Do not begin unrelated work. Record commands and actual outputs in a compact result."
+        )
+        transport = self.transport_factory(cwd=record["repo"], session_id=record["session_id"])
+        try:
+            result = transport.run(prompt)
+        finally:
+            transport.terminate()
+        with self.ledger.operation_lock():
             self.ledger.mark_delivered(task_id, pane_nonce=record["nonce"])
             message = (result.get("result") or "").strip()
             if not message:
@@ -548,9 +594,10 @@ class ClaudePrintAdapter:
 
     def observe_lane(self, lane):
         """Always None, for the same reason as `ACPAdapter.observe_lane`/
-        `PiRPCAdapter.observe_lane`: `run` already blocks until the turn
-        settles, so a task either completed inline in `assign_task` or the
-        call is still in flight -- there is no pane to poll in between."""
+        `PiRPCAdapter.observe_lane`: `deliver_task` already blocks until the
+        turn settles, so a task either completed inline there or the call is
+        still in flight (agent-supervisor#278: now possibly in a different,
+        backgrounded process) -- there is no pane to poll in between."""
         self._verified_lane(lane)
         return None
 

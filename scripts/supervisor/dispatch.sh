@@ -138,6 +138,18 @@
 #              three shapes, and silently dropping one would be worse than
 #              routing it the old way; see agent-supervisor#171's own
 #              tracked follow-up.
+# --wait
+#              agent-supervisor#278: only meaningful for the claude-print
+#              default path above. That path returns as soon as the brief is
+#              assigned in the ledger -- the real `claude -p` turn runs
+#              detached, so a successful dispatch and a still-working one
+#              both return in seconds. `--wait` asks for the pre-#278
+#              behaviour instead: block until the task the lane was given
+#              actually reaches `complete`, the same shape a human typing
+#              into a live pane and waiting would see. Forwarded verbatim to
+#              `dispatch-claude-print.sh`; a no-op on the tmux flow, which
+#              was never blocking in the first place (`send-keys` returns the
+#              moment the keystroke lands, not when the pane goes idle).
 #
 # Exit 0 only when a lane has been sent a brief -- over tmux/send-keys, or
 # (new, #171, default for a plain single-issue `claude` dispatch) over a
@@ -237,6 +249,12 @@ PR=""
 # about their coverage of #241/#212/#159/etc. changed. A real caller with
 # no reason to force the old pane sets nothing and gets the new default.
 LIVE_PANE="${DISPATCH_LIVE_PANE:-}"
+# agent-supervisor#278: the explicit opt-BACK-IN to the pre-#278 blocking
+# claude-print behaviour -- see this flag's own usage comment above. Only
+# ever forwarded to dispatch-claude-print.sh (step 1.5 below); the tmux flow
+# never blocked on task completion in the first place, so this has nothing
+# to do there.
+WAIT=""
 POSITIONAL=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -276,6 +294,11 @@ while [ $# -gt 0 ]; do
       # dispatch over `claude-print` and leaves the candidate pane untouched.
       # Takes no value, same shape as --not-a-review.
       LIVE_PANE=1
+      shift
+      ;;
+    --wait)
+      # agent-supervisor#278. Takes no value, same shape as --live-pane.
+      WAIT=1
       shift
       ;;
     --not-a-review)
@@ -1373,7 +1396,12 @@ if [ "$LANE_HARNESS" = claude ] && [ -z "$LIVE_PANE" ] \
     exit 1
   else
     echo "dispatch: claude lane $LANE selected -- routing #$ISSUE_ARG over claude-print instead (agent-supervisor#171); $LANE stays free for --live-pane work" >&2
-    "$HERE/dispatch-claude-print.sh" "$ISSUE_ARG" "$SLUG" "$BRIEF" "$CLAUDE_PRINT_REPO" "$REPO_PATH"
+    # agent-supervisor#278: an array, not string interpolation, so an unset
+    # $WAIT contributes zero words instead of a stray empty positional that
+    # would shift $REPO_PATH out of dispatch-claude-print.sh's slot 5.
+    CLAUDE_PRINT_ARGS=("$ISSUE_ARG" "$SLUG" "$BRIEF" "$CLAUDE_PRINT_REPO" "$REPO_PATH")
+    [ -z "$WAIT" ] || CLAUDE_PRINT_ARGS+=(--wait)
+    "$HERE/dispatch-claude-print.sh" "${CLAUDE_PRINT_ARGS[@]}"
     exit $?
   fi
 fi

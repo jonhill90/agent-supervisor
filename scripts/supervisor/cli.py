@@ -110,6 +110,17 @@ def parser():
     assign.add_argument("--task", required=True)
     assign.add_argument("--summary", required=True)
 
+    # agent-supervisor#278: the blocking half `ClaudePrintAdapter.assign_task`
+    # used to do inline -- split out so `dispatch-claude-print.sh` can call
+    # `assign` (fast, ledger-only) and return, then background this call (or
+    # run it inline under `--wait`) rather than blocking on the whole task.
+    # Only `ClaudePrintAdapter` implements `deliver_task`; calling this
+    # against any other lane's adapter raises `AttributeError`, same as
+    # calling any other verb this parser does not define for that harness.
+    deliver = sub.add_parser("deliver")
+    deliver.add_argument("--lane", required=True)
+    deliver.add_argument("--task", required=True)
+
     # The write-only recording pair (agent-dotfiles#140). See `record_dispatch`
     # for why these exist next to `register`/`assign`/`complete` rather than
     # reusing them.
@@ -976,6 +987,8 @@ def main(argv=None):
         )
     elif args.command == "assign":
         value = adapter_for_lane(args.lane).assign_task(lane=args.lane, task_id=args.task, summary=args.summary)
+    elif args.command == "deliver":
+        value = adapter_for_lane(args.lane).deliver_task(lane=args.lane, task_id=args.task)
     elif args.command == "record-dispatch":
         value = record_dispatch(
             ledger,

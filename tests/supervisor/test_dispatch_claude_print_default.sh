@@ -82,6 +82,7 @@ run() {
     STUB_PANE_PATH="${STUB_PANE_PATH:-$REPO}" \
     CLAUDE_PRINT_BROKEN="${CLAUDE_PRINT_BROKEN:-}" \
     CLAUDE_PRINT_LOG="${CLAUDE_PRINT_LOG:-}" \
+    CLAUDE_PRINT_RESUME_DELAY="${CLAUDE_PRINT_RESUME_DELAY:-}" \
     WORKTREE_ROOT="$D/roots" bash "$DISPATCH" "$@" 2>&1
 }
 lane_row() {  # lane_row <state-dir> <lane> -> transport, or '' if unregistered
@@ -110,13 +111,37 @@ from core import Ledger
 print(Ledger(sys.argv[2]).lane_available(sys.argv[3]))
 ' "$HERE/../../scripts/supervisor" "$1" "$2" 2>&1
 }
+# agent-supervisor#278: delivery now runs detached by default, so a caller
+# that wants to see the eventual outcome has to poll -- the same posture
+# real production takes (`cli.py lane-diagnostic` + GitHub), not a blocking
+# waiter. 50 tries at 0.2s is 10s of headroom -- comfortably past every
+# CLAUDE_PRINT_RESUME_DELAY this file uses (max 5s) plus noise on a loaded
+# CI box, without making a passing test wait the full 10s (it breaks the
+# moment the status matches).
+wait_for_status() {  # wait_for_status <state-dir> <task-id> <want> -> last-seen status
+  local state="$1" task="$2" want="$3" seen="" i
+  for i in $(seq 1 50); do
+    seen=$(task_status "$state" "$task")
+    [ "$seen" = "$want" ] && break
+    sleep 0.2
+  done
+  echo "$seen"
+}
 
 # --- 1. the default: a plain, single-issue claude dispatch goes over
-#        claude-print, and the candidate tmux pane is never touched --------
+#        claude-print, RETURNS ONCE THE BRIEF IS ASSIGNED -- not once the
+#        task completes (agent-supervisor#278) -- and the candidate tmux
+#        pane is never touched -----------------------------------------------
 one_claude_lane
 echo '171|| Migrate the default' > "$D/issues"
 LEDGER_STATE="$D/state-171"
 CLAUDE_PRINT_LOG="$D/print.log"
+# The stub sleeps 3s on the --resume (deliver) call only -- long enough that
+# a dispatch which still blocked on it would fail want_exit's timing-free
+# check by taking visibly longer than the polling below tolerates for
+# "already done"; case 1b, right after this, gives that its own explicit
+# wall-clock assertion.
+CLAUDE_PRINT_RESUME_DELAY=3
 out=$(run 171 migrate-default "$D/brief.md" acme/agent-dotfiles "$REPO"); rc=$?
 want_exit "a plain claude dispatch succeeds" "$rc" 0 "$out"
 want_contains "dispatch says it routed over claude-print" "routing #171 over claude-print" "$out"
@@ -147,16 +172,77 @@ else
   bad "the NEW lane's ledger row reads transport=claude-print" "got '$NEW_TRANSPORT'"
 fi
 
-TASK_STATUS=$(task_status "$D/state-171" "$NEW_LANE")
-if [ "$TASK_STATUS" = "complete" ]; then
-  ok "the claude-print task reached complete"
+# agent-supervisor#278: the ledger row exists THE MOMENT dispatch returns --
+# `delivery_pending`, not `complete` yet, because the 3s `claude -p` turn the
+# stub is simulating is still running detached. A dispatch that still
+# blocked on delivery (the pre-#278 bug) would already read `complete` here.
+TASK_STATUS_AT_RETURN=$(task_status "$D/state-171" "$NEW_LANE")
+if [ "$TASK_STATUS_AT_RETURN" = "delivery_pending" ]; then
+  ok "the ledger row exists as delivery_pending the moment dispatch returns"
 else
-  bad "the claude-print task reached complete" "got status '$TASK_STATUS'"
+  bad "the ledger row exists as delivery_pending the moment dispatch returns" "got status '$TASK_STATUS_AT_RETURN'"
+fi
+want_contains "dispatch says delivery is running detached" "delivery running detached" "$out"
+want_contains "dispatch prints the lane id" "  lane:     $NEW_LANE" "$out"
+want_contains "dispatch prints the task id" "  task:     $NEW_LANE" "$out"
+
+# The work continues after dispatch returns -- observed the way every other
+# lane's completion is observed, by polling the ledger, not by a blocking
+# waiter still held open in this process.
+TASK_STATUS=$(wait_for_status "$D/state-171" "$NEW_LANE" complete)
+if [ "$TASK_STATUS" = "complete" ]; then
+  ok "the claude-print task reaches complete once delivery (still running after dispatch returned) finishes"
+else
+  bad "the claude-print task reaches complete once delivery (still running after dispatch returned) finishes" "got status '$TASK_STATUS'"
 fi
 
 want_contains "the real brief pointer crossed claude's argv, never send-keys" \
   "$D/brief.md" "$(cat "$D/print.log" 2>/dev/null)"
 CLAUDE_PRINT_LOG=""
+CLAUDE_PRINT_RESUME_DELAY=""
+
+# --- 1b. the return itself is bounded -- fails if dispatch ever blocks on
+#         delivery again (the regression #278 exists to catch) -------------
+one_claude_lane
+echo '172|| Bounded return time' > "$D/issues"
+LEDGER_STATE="$D/state-bounded"
+CLAUDE_PRINT_RESUME_DELAY=5
+START=$(date +%s)
+out=$(run 172 bounded-return "$D/brief.md" acme/agent-dotfiles "$REPO"); rc=$?
+ELAPSED=$(( $(date +%s) - START ))
+CLAUDE_PRINT_RESUME_DELAY=""
+want_exit "a dispatch with a slow delivery still succeeds" "$rc" 0 "$out"
+# The delivery the stub is simulating takes 5s; a dispatch that returns in
+# under half that has plainly not waited for it. Generous on purpose --
+# CI/host scheduling noise, not a tight race, is what this margin buys.
+if [ "$ELAPSED" -lt 3 ]; then
+  ok "dispatch.sh returns in ${ELAPSED}s, well under the 5s delivery it dispatched"
+else
+  bad "dispatch.sh returns in ${ELAPSED}s, well under the 5s delivery it dispatched" "took ${ELAPSED}s -- dispatch blocked on delivery"
+fi
+BOUNDED_LANE="ad172-bounded-return"
+BOUNDED_STATUS=$(wait_for_status "$D/state-bounded" "$BOUNDED_LANE" complete)
+if [ "$BOUNDED_STATUS" = "complete" ]; then
+  ok "the bounded-return dispatch's task also reaches complete once its detached delivery finishes"
+else
+  bad "the bounded-return dispatch's task also reaches complete once its detached delivery finishes" "got status '$BOUNDED_STATUS'"
+fi
+
+# --- 1c. --wait opts back into the pre-#278 blocking behaviour -------------
+one_claude_lane
+echo '178|| Explicit wait' > "$D/issues"
+LEDGER_STATE="$D/state-wait"
+CLAUDE_PRINT_RESUME_DELAY=1
+out=$(run --wait 178 explicit-wait "$D/brief.md" acme/agent-dotfiles "$REPO"); rc=$?
+CLAUDE_PRINT_RESUME_DELAY=""
+want_exit "--wait dispatches successfully" "$rc" 0 "$out"
+want_contains "--wait reports the task complete inline" "task ad178-explicit-wait complete" "$out"
+WAIT_STATUS=$(task_status "$D/state-wait" "ad178-explicit-wait")
+if [ "$WAIT_STATUS" = "complete" ]; then
+  ok "--wait's task is already complete by the time dispatch returns"
+else
+  bad "--wait's task is already complete by the time dispatch returns" "got status '$WAIT_STATUS'"
+fi
 
 # --- 2. --live-pane opts back into the pre-#171 tmux flow, unchanged ------
 one_claude_lane
